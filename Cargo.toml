@@ -1,0 +1,11 @@
+[package]
+name = "vsdg"
+version = "0.1.0"
+authors = ["bcata6 <b.catalin611@gmail.com>"]
+repository = "https://github.com/lykenware/vsdg"
+license = "MIT/Apache-2.0"
+description = "VSDG (Value State Dependence Graph) optimizer."
+
+[lib]
+doctest = false
+test = false
