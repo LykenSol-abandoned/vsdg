@@ -1,6 +1,8 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::Hash;
+use std::mem;
 use std::num::NonZeroU32;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -109,7 +111,8 @@ impl<K> Graph<K> {
     }
 
     fn maybe_release_node(&self, id: NodeId) {
-        if self.node_data(id).ref_count.get() == 0 {
+        // HACK keep all nodes alive.
+        if self.node_data(id).ref_count.get() == 0 && false {
             // FIXME: do this without borrow_mut.
             let mut nodes = self.nodes.borrow_mut();
             let data = &mut nodes[id.index()];
@@ -169,6 +172,16 @@ impl<'g, K> Node<'g, K> {
     }
 }
 
+impl<'g, K: fmt::Debug> fmt::Debug for Node<'g, K> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{:?}",
+            self.graph.kinds.borrow()[self.data().kind as usize]
+        )
+    }
+}
+
 impl<'g, K> Clone for Node<'g, K> {
     fn clone(&self) -> Self {
         self.graph.node_handle(self.id)
@@ -177,8 +190,10 @@ impl<'g, K> Clone for Node<'g, K> {
 
 impl<'g, K> Drop for Node<'g, K> {
     fn drop(&mut self) {
-        let data = self.data();
-        data.ref_count.set(data.ref_count.get() - 1);
+        {
+            let data = self.data();
+            data.ref_count.set(data.ref_count.get() - 1);
+        }
         self.graph.maybe_release_node(self.id);
     }
 }
@@ -254,6 +269,7 @@ impl<'g, K> DoubleEndedIterator for Edges<'g, K> {
     }
 }
 
+#[derive(Clone)]
 pub struct Input<'g, K: 'g>(Port<'g, K>);
 
 impl<'g, K> Input<'g, K> {
@@ -297,9 +313,12 @@ impl<'g, K> Input<'g, K> {
                 last: self.0.id(),
             }));
         }
+        // HACK keep the source alive.
+        mem::forget(source);
     }
 }
 
+#[derive(Clone)]
 pub struct Output<'g, K: 'g>(Port<'g, K>);
 
 impl<'g, K> Output<'g, K> {
