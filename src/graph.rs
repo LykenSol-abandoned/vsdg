@@ -44,7 +44,6 @@ struct NodeData {
     ports: Vec<PortData>,
     kind: u32,
     ref_count: Cell<u32>,
-    input_count: u32,
 }
 
 pub struct Graph<K> {
@@ -53,9 +52,16 @@ pub struct Graph<K> {
     kind_index: RefCell<HashMap<K, u32>>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Sig {
+    pub val_ins: u32,
+    pub st_ins: u32,
+    pub val_outs: u32,
+    pub st_outs: u32,
+}
+
 pub trait NodeKind: Clone + Eq + Hash + fmt::Debug {
-    fn num_inputs(&self) -> usize;
-    fn num_outputs(&self) -> usize;
+    fn sig(&self) -> Sig;
 }
 
 impl<K> Graph<K> {
@@ -68,7 +74,6 @@ impl<K> Graph<K> {
                 ports: vec![],
                 kind: 0,
                 ref_count: Cell::new(0),
-                input_count: 0,
             }]),
             kinds: RefCell::new(vec![]),
             kind_index: RefCell::new(HashMap::new()),
@@ -79,8 +84,8 @@ impl<K> Graph<K> {
     where
         K: NodeKind,
     {
-        let num_inputs = kind.num_inputs();
-        let num_outputs = kind.num_outputs();
+        let sig = kind.sig();
+        let num_ports = sig.val_ins + sig.st_ins + sig.val_outs + sig.st_outs;
         let kind = *self
             .kind_index
             .borrow_mut()
@@ -93,10 +98,9 @@ impl<K> Graph<K> {
         let id = {
             let mut nodes = self.nodes.borrow_mut();
             nodes.push(NodeData {
-                ports: vec![PortData::default(); num_inputs + num_outputs],
+                ports: vec![PortData::default(); num_ports as usize],
                 kind: kind as u32,
                 ref_count: Cell::new(0),
-                input_count: num_inputs as u32,
             });
             NodeId(NonZeroU32::new(nodes.len() as u32 - 1).unwrap())
         };
@@ -109,13 +113,24 @@ impl<K> Graph<K> {
     {
         writeln!(out, "digraph vsdg {{")?;
         for id in 1..self.nodes.borrow().len() {
-            let node = self.node_handle(NodeId(NonZero::new(id as u32).unwrap()));
+            let node = self.node_handle(NodeId(NonZeroU32::new(id as u32).unwrap()));
             writeln!(out, r#"    {} [label="{:?}"]"#, node.id.index(), node)?;
-            for i in 0..node.num_inputs() {
-                for source in node.input(i).sources() {
+            let sig = node.kind().sig();
+            for i in 0..sig.val_ins {
+                for source in node.val_in(i as usize).sources() {
                     writeln!(
                         out,
-                        "    {} -> {}",
+                        "    {} -> {} [color=blue]",
+                        source.0.node.id.index(),
+                        node.id.index()
+                    )?;
+                }
+            }
+            for i in 0..sig.st_ins {
+                for source in node.st_in(i as usize).sources() {
+                    writeln!(
+                        out,
+                        "    {} -> {} [style=dashed, color=red]",
                         source.0.node.id.index(),
                         node.id.index()
                     )?;
@@ -141,7 +156,6 @@ impl<K> Graph<K> {
             let data = &mut nodes[id.index()];
             data.ports.clear();
             data.kind = 0;
-            data.input_count = 0;
         }
     }
 
@@ -169,28 +183,47 @@ impl<'g, K> Node<'g, K> {
         self.graph.node_data(self.id)
     }
 
-    pub fn num_inputs(&self) -> usize {
-        self.data().input_count as usize
+    pub fn kind(&self) -> Ref<'g, K> {
+        Ref::map(self.graph.kinds.borrow(), |kinds| {
+            &kinds[self.data().kind as usize]
+        })
     }
+}
 
-    pub fn num_outputs(&self) -> usize {
-        let data = self.data();
-        data.ports.len() - data.input_count as usize
-    }
-
-    pub fn input(&self, i: usize) -> Input<'g, K> {
-        assert!(i < self.num_inputs());
-        Input(Port {
+impl<'g, K: NodeKind> Node<'g, K> {
+    pub fn val_in(&self, i: usize) -> ValIn<'g, K> {
+        let sig = self.kind().sig();
+        assert!(i < sig.val_ins as usize);
+        ValIn(Port {
             node: self.clone(),
             port: i as u32,
         })
     }
 
-    pub fn output(&self, i: usize) -> Output<'g, K> {
-        assert!(i < self.num_outputs());
-        Output(Port {
+    pub fn st_in(&self, i: usize) -> StIn<'g, K> {
+        let sig = self.kind().sig();
+        assert!(i < sig.st_ins as usize);
+        StIn(Port {
             node: self.clone(),
-            port: (self.num_inputs() + i) as u32,
+            port: sig.val_ins + i as u32,
+        })
+    }
+
+    pub fn val_out(&self, i: usize) -> ValOut<'g, K> {
+        let sig = self.kind().sig();
+        assert!(i < sig.val_outs as usize);
+        ValOut(Port {
+            node: self.clone(),
+            port: sig.val_ins + sig.st_ins + i as u32,
+        })
+    }
+
+    pub fn st_out(&self, i: usize) -> StOut<'g, K> {
+        let sig = self.kind().sig();
+        assert!(i < sig.st_outs as usize);
+        StOut(Port {
+            node: self.clone(),
+            port: sig.val_ins + sig.st_ins + sig.val_outs + i as u32,
         })
     }
 }
@@ -293,25 +326,25 @@ impl<'g, K> DoubleEndedIterator for Edges<'g, K> {
 }
 
 #[derive(Clone)]
-pub struct Input<'g, K: 'g>(Port<'g, K>);
+pub struct ValIn<'g, K: 'g>(Port<'g, K>);
 
-impl<'g, K> Input<'g, K> {
-    pub fn sources(&self) -> impl Iterator<Item = Output<'g, K>> {
-        self.0.edges().map(Output)
+impl<'g, K> ValIn<'g, K> {
+    pub fn sources(&self) -> impl Iterator<Item = ValOut<'g, K>> {
+        self.0.edges().map(ValOut)
     }
 
-    pub fn maybe_source(&self) -> Option<Output<'g, K>> {
+    pub fn maybe_source(&self) -> Option<ValOut<'g, K>> {
         let mut sources = self.sources();
         let source = sources.next();
         assert!(sources.next().is_none());
         source
     }
 
-    pub fn source(&self) -> Output<'g, K> {
+    pub fn source(&self) -> ValOut<'g, K> {
         self.maybe_source().unwrap()
     }
 
-    pub fn set_source(&self, source: Output<'g, K>) {
+    pub fn set_source(&self, source: ValOut<'g, K>) {
         let source_data = source.0.data();
         let sink_data = self.0.data();
         assert!(sink_data.edges.get().is_none());
@@ -342,10 +375,68 @@ impl<'g, K> Input<'g, K> {
 }
 
 #[derive(Clone)]
-pub struct Output<'g, K: 'g>(Port<'g, K>);
+pub struct StIn<'g, K: 'g>(Port<'g, K>);
 
-impl<'g, K> Output<'g, K> {
-    pub fn sinks(&self) -> impl Iterator<Item = Input<'g, K>> {
-        self.0.edges().map(Input)
+impl<'g, K> StIn<'g, K> {
+    pub fn sources(&self) -> impl Iterator<Item = StOut<'g, K>> {
+        self.0.edges().map(StOut)
+    }
+
+    pub fn maybe_source(&self) -> Option<StOut<'g, K>> {
+        let mut sources = self.sources();
+        let source = sources.next();
+        assert!(sources.next().is_none());
+        source
+    }
+
+    pub fn source(&self) -> StOut<'g, K> {
+        self.maybe_source().unwrap()
+    }
+
+    pub fn set_source(&self, source: StOut<'g, K>) {
+        let source_data = source.0.data();
+        let sink_data = self.0.data();
+        assert!(sink_data.edges.get().is_none());
+        sink_data.edges.set(Some(PortList {
+            first: source.0.id(),
+            last: source.0.id(),
+        }));
+        if let Some(mut edges) = source_data.edges.get() {
+            source
+                .0
+                .node
+                .graph
+                .port_data(edges.last)
+                .next_edge
+                .set(Some(self.0.id()));
+            sink_data.prev_edge.set(Some(edges.last));
+            edges.last = self.0.id();
+            source_data.edges.set(Some(edges));
+        } else {
+            source_data.edges.set(Some(PortList {
+                first: self.0.id(),
+                last: self.0.id(),
+            }));
+        }
+        // HACK keep the source alive.
+        mem::forget(source);
+    }
+}
+
+#[derive(Clone)]
+pub struct ValOut<'g, K: 'g>(Port<'g, K>);
+
+impl<'g, K> ValOut<'g, K> {
+    pub fn sinks(&self) -> impl Iterator<Item = ValIn<'g, K>> {
+        self.0.edges().map(ValIn)
+    }
+}
+
+#[derive(Clone)]
+pub struct StOut<'g, K: 'g>(Port<'g, K>);
+
+impl<'g, K> StOut<'g, K> {
+    pub fn sinks(&self) -> impl Iterator<Item = StIn<'g, K>> {
+        self.0.edges().map(StIn)
     }
 }

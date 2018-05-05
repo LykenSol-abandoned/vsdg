@@ -1,6 +1,7 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::{InstructionData, InstructionFormat};
 use cranelift_codegen::ir::{self, FuncRef, Heap, MemFlags, Opcode, TrapCode, Value, ValueDef};
+use graph::{self, NodeKind, Sig};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -14,8 +15,9 @@ pub enum Op {
     HeapAddr { opcode: Opcode, heap: Heap },
     Memory { opcode: Opcode, flags: MemFlags },
     Trap { opcode: Opcode, code: TrapCode },
-    IndirectCall { input_count: u32, output_count: u32 },
-    Param,
+    IndirectCall { sig: Sig },
+    ParamVal,
+    ParamSt,
 }
 
 impl fmt::Debug for Op {
@@ -29,79 +31,82 @@ impl fmt::Debug for Op {
             Op::HeapAddr { opcode, heap } => write!(f, "{:?}({:?})", opcode, heap),
             Op::Memory { opcode, flags } => write!(f, "{:?}({:?})", opcode, flags),
             Op::Trap { opcode, code } => write!(f, "{:?}({:?})", opcode, code),
-            Op::IndirectCall {
-                input_count,
-                output_count,
-            } => write!(f, "IndirectCall({}, {})", input_count, output_count),
-            Op::Param => write!(f, "Param"),
+            Op::IndirectCall { sig } => write!(f, "IndirectCall({:?})", sig),
+            Op::ParamVal => write!(f, "ParamVal"),
+            Op::ParamSt => write!(f, "ParamSt"),
         }
     }
 }
 
-impl ::graph::NodeKind for Op {
-    fn num_inputs(&self) -> usize {
+impl NodeKind for Op {
+    fn sig(&self) -> Sig {
         use self::Op::*;
-        match *self {
-            Simple { opcode } => match opcode.format() {
-                InstructionFormat::NullAry => 0,
-                InstructionFormat::Unary => 1,
-                InstructionFormat::Binary => 2,
-                InstructionFormat::Ternary => 3,
-                _ => unreachable!(),
-            },
-            Const { .. } | FuncAddr { .. } | Param => 0,
-            HeapAddr { .. } => 2,
-            IntCmp { .. } | FloatCmp { .. } => 2,
+        let (val_ins, st_ins, val_outs, st_outs) = match *self {
+            Simple { opcode } => (
+                match opcode.format() {
+                    InstructionFormat::NullAry => 0,
+                    InstructionFormat::Unary => 1,
+                    InstructionFormat::Binary | InstructionFormat::BinaryImm => 2,
+                    InstructionFormat::Ternary => 3,
+                    _ => unreachable!(),
+                },
+                0,
+                1,
+                0,
+            ),
+            Const { .. } | FuncAddr { .. } | ParamVal => (0, 0, 1, 0),
+            HeapAddr { .. } => (2, 0, 1, 0),
+            IntCmp { .. } | FloatCmp { .. } => (2, 0, 1, 0),
 
-            Memory { opcode, .. } => 1 + opcode.can_store() as usize + 1,
-            Trap { .. } => 0 + 1,
+            ParamSt => (0, 0, 0, 1),
+            Memory { opcode, .. } => (
+                1 + opcode.can_store() as u32,
+                1,
+                opcode.can_load() as u32,
+                1,
+            ),
+            Trap { .. } => (0, 1, 0, 1),
 
-            IndirectCall { input_count, .. } => 1 + input_count as usize,
-        }
-    }
-
-    fn num_outputs(&self) -> usize {
-        use self::Op::*;
-        match *self {
-            Simple { .. }
-            | Const { .. }
-            | IntCmp { .. }
-            | FloatCmp { .. }
-            | FuncAddr { .. }
-            | HeapAddr { .. }
-            | Param => 1,
-
-            Memory { opcode, .. } => opcode.can_load() as usize + 1,
-            Trap { .. } => 0 + 1,
-
-            IndirectCall { output_count, .. } => output_count as usize,
+            IndirectCall { mut sig } => {
+                sig.val_ins += 1;
+                return sig;
+            }
+        };
+        Sig {
+            val_ins,
+            st_ins,
+            val_outs,
+            st_outs,
         }
     }
 }
 
-pub type Graph = ::graph::Graph<Op>;
-pub type Node<'g> = ::graph::Node<'g, Op>;
-pub type Input<'g> = ::graph::Input<'g, Op>;
-pub type Output<'g> = ::graph::Output<'g, Op>;
+pub type Graph = graph::Graph<Op>;
+pub type Node<'g> = graph::Node<'g, Op>;
+pub type ValIn<'g> = graph::ValIn<'g, Op>;
+pub type StIn<'g> = graph::StIn<'g, Op>;
+pub type ValOut<'g> = graph::ValOut<'g, Op>;
+pub type StOut<'g> = graph::StOut<'g, Op>;
 
 pub struct ConstructCx<'g> {
     func: &'g ir::Function,
     graph: &'g Graph,
     instructions: HashMap<ir::Inst, Node<'g>>,
-    ebb_params: HashMap<(ir::Ebb, usize), Output<'g>>,
+    ebb_params: HashMap<ir::Ebb, (Vec<ValOut<'g>>, StOut<'g>)>,
+    cur_st: Option<StOut<'g>>,
 }
 
 impl<'g> ConstructCx<'g> {
-    fn value(&self, value: Value) -> Output<'g> {
+    fn value(&self, value: Value) -> ValOut<'g> {
         match self.func.dfg.value_def(value) {
             ValueDef::Result(inst, num) => match self.instructions.get(&inst) {
-                Some(node) => node.output(num),
+                Some(node) => node.val_out(num),
                 None => panic!(
                     "Instruction {:?} (producing value {:?}) missing!\n{:?}",
                     inst, value, self.func
                 ),
             },
-            ValueDef::Param(ebb, num) => self.ebb_params.get(&(ebb, num)).unwrap().clone(),
+            ValueDef::Param(ebb, num) => self.ebb_params[&ebb].0[num].clone(),
         }
     }
 
@@ -117,33 +122,26 @@ impl<'g> ConstructCx<'g> {
         self.const_i64(opcode, imm as i64)
     }
 
-    fn unary(&self, op: Op, x: Output<'g>) -> Node<'g> {
+    fn unary(&self, op: Op, x: ValOut<'g>) -> Node<'g> {
         let node = self.graph.add(op);
-        node.input(0).set_source(x);
+        node.val_in(0).set_source(x);
         node
     }
 
-    fn binary(&self, op: Op, a: Output<'g>, b: Output<'g>) -> Node<'g> {
+    fn binary(&self, op: Op, a: ValOut<'g>, b: ValOut<'g>) -> Node<'g> {
         let node = self.graph.add(op);
-        node.input(0).set_source(a);
-        node.input(1).set_source(b);
+        node.val_in(0).set_source(a);
+        node.val_in(1).set_source(b);
         node
     }
 
-    fn ternary(&self, op: Op, a: Output<'g>, b: Output<'g>, c: Output<'g>) -> Node<'g> {
+    fn ternary(&self, op: Op, a: ValOut<'g>, b: ValOut<'g>, c: ValOut<'g>) -> Node<'g> {
         let node = self.graph.add(op);
-        node.input(0).set_source(a);
-        node.input(1).set_source(b);
-        node.input(2).set_source(c);
+        node.val_in(0).set_source(a);
+        node.val_in(1).set_source(b);
+        node.val_in(2).set_source(c);
         node
     }
-
-    // fn intCompare(&mut self, op: Op, a: Output<'g>, b: Output<'g>) -> Node<'g> {
-    //     let node =  self.graph.add(op);
-    //     node.input(0).set_source(a);
-    //     node.input(1).set_source(b);
-    //     node
-    // }
 
     fn convert_inst(&mut self, inst: ir::Inst) {
         let node = match self.func.dfg[inst] {
@@ -155,12 +153,21 @@ impl<'g> ConstructCx<'g> {
 
             InstructionData::UnaryImm { opcode, imm } => self.const_i64(opcode, imm.into()),
 
+            // | InstructionData::UnaryGlobalVar { opcode, .. }
+            // | InstructionData::UnaryBool { opcode, imm }
+            // | InstructionData::UnaryIeee32 { opcode, imm }
             InstructionData::UnaryIeee64 { opcode, imm } => self.const_u64(opcode, imm.bits()),
 
             InstructionData::Binary {
                 opcode,
                 args: [a, b],
             } => self.binary(Op::Simple { opcode }, self.value(a), self.value(b)),
+
+            InstructionData::BinaryImm { opcode, arg, imm } => self.binary(
+                Op::Simple { opcode },
+                self.value(arg),
+                self.const_i64(Opcode::Iconst, imm.into()).val_out(0),
+            ),
 
             InstructionData::Ternary {
                 opcode,
@@ -172,10 +179,6 @@ impl<'g> ConstructCx<'g> {
                 self.value(c),
             ),
 
-            // | InstructionData::UnaryGlobalVar { opcode, .. }
-            // | InstructionData::UnaryBool { opcode, imm } => {}
-            // | InstructionData::UnaryIeee32 { opcode, imm }
-            // | InstructionData::BinaryImm { opcode, .. }
             InstructionData::IntCompare {
                 opcode,
                 cond,
@@ -190,7 +193,7 @@ impl<'g> ConstructCx<'g> {
             } => self.binary(
                 Op::IntCmp { opcode, cond },
                 self.value(arg),
-                self.const_i64(Opcode::Iconst, imm.into()).output(0),
+                self.const_i64(Opcode::Iconst, imm.into()).val_out(0),
             ),
 
             InstructionData::IntCond { opcode, cond, arg } => {
@@ -207,7 +210,35 @@ impl<'g> ConstructCx<'g> {
                 self.unary(Op::FloatCmp { opcode, cond }, self.value(arg))
             }
 
-            //InstructionData::IndirectCall | InstructionData::Call
+            //InstructionData::IndirectCall
+            InstructionData::Call {
+                opcode: Opcode::Call,
+                ref args,
+                func_ref,
+            } => {
+                let args = args.as_slice(&self.func.dfg.value_lists);
+                let node = self.unary(
+                    Op::IndirectCall {
+                        sig: Sig {
+                            val_ins: args.len() as u32,
+                            st_ins: 1,
+                            val_outs: self.func.dfg.inst_results(inst).len() as u32,
+                            st_outs: 1,
+                        },
+                    },
+                    self.graph
+                        .add(Op::FuncAddr {
+                            opcode: Opcode::FuncAddr,
+                            func_ref,
+                        })
+                        .val_out(0),
+                );
+                for (i, &arg) in args.iter().enumerate() {
+                    node.val_in(1 + i).set_source(self.value(arg));
+                }
+                node
+            }
+
             InstructionData::FuncAddr { opcode, func_ref } => {
                 self.graph.add(Op::FuncAddr { opcode, func_ref })
             }
@@ -219,7 +250,7 @@ impl<'g> ConstructCx<'g> {
             } => self.binary(
                 Op::HeapAddr { opcode, heap },
                 self.value(arg),
-                self.const_i64(Opcode::Iconst, imm.into()).output(0),
+                self.const_i64(Opcode::Iconst, imm.into()).val_out(0),
             ),
 
             InstructionData::Load {
@@ -234,8 +265,8 @@ impl<'g> ConstructCx<'g> {
                         opcode: Opcode::Iadd,
                     },
                     self.value(arg),
-                    self.const_i32(Opcode::Iconst, offset.into()).output(0),
-                ).output(0),
+                    self.const_i32(Opcode::Iconst, offset.into()).val_out(0),
+                ).val_out(0),
             ),
             InstructionData::Store {
                 opcode,
@@ -250,46 +281,54 @@ impl<'g> ConstructCx<'g> {
                         opcode: Opcode::Iadd,
                     },
                     self.value(ptr),
-                    self.const_i32(Opcode::Iconst, offset.into()).output(0),
-                ).output(0),
+                    self.const_i32(Opcode::Iconst, offset.into()).val_out(0),
+                ).val_out(0),
             ),
 
             InstructionData::Trap { opcode, code } => self.graph.add(Op::Trap { opcode, code }),
+
             _ => {
-                println!(
+                panic!(
                     "{:?} = {:?}",
                     self.func.dfg.inst_results(inst),
                     self.func.dfg[inst]
                 );
-                self.graph.add(Op::Trap {
-                    opcode: Opcode::Trap,
-                    code: TrapCode::User(0),
-                })
             }
         };
+        let sig = node.kind().sig();
+        assert_eq!(sig.st_ins, sig.st_outs);
+        if sig.st_ins == 1 {
+            node.st_in(0).set_source(self.cur_st.take().unwrap());
+            self.cur_st = Some(node.st_out(0));
+        }
         self.instructions.insert(inst, node);
     }
 }
 
-pub fn construct_function<'g>(
-    graph: &'g Graph,
-    func: &ir::Function,
-) -> (Vec<Vec<Input<'g>>>, Vec<Output<'g>>) {
+pub fn construct_function<'g>(graph: &'g Graph, func: &ir::Function) {
     let mut cx = ConstructCx {
         func,
         graph,
         instructions: HashMap::new(),
-        ebb_params: HashMap::new(),
+        ebb_params: func.layout
+            .ebbs()
+            .map(|ebb| {
+                (
+                    ebb,
+                    (
+                        (0..func.dfg.num_ebb_params(ebb))
+                            .map(|_| graph.add(Op::ParamVal).val_out(0))
+                            .collect(),
+                        graph.add(Op::ParamSt).st_out(0),
+                    ),
+                )
+            })
+            .collect(),
+        cur_st: None,
     };
 
     for ebb in func.layout.ebbs() {
-        for num in 0..func.dfg.num_ebb_params(ebb) {
-            cx.ebb_params
-                .insert((ebb, num), graph.add(Op::Param).output(0));
-        }
-    }
-
-    for ebb in func.layout.ebbs() {
+        cx.cur_st = Some(cx.ebb_params[&ebb].1.clone());
         for inst in func.layout.ebb_insts(ebb) {
             match func.dfg[inst] {
                 InstructionData::Jump { .. }
@@ -300,5 +339,4 @@ pub fn construct_function<'g>(
             cx.convert_inst(inst);
         }
     }
-    (vec![], vec![])
 }
