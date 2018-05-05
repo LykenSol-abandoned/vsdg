@@ -2,6 +2,7 @@ use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
+use std::io::{self, Write};
 use std::mem;
 use std::num::NonZeroU32;
 
@@ -52,7 +53,7 @@ pub struct Graph<K> {
     kind_index: RefCell<HashMap<K, u32>>,
 }
 
-pub trait NodeKind: Clone + Eq + Hash {
+pub trait NodeKind: Clone + Eq + Hash + fmt::Debug {
     fn num_inputs(&self) -> usize;
     fn num_outputs(&self) -> usize;
 }
@@ -100,6 +101,28 @@ impl<K> Graph<K> {
             NodeId(NonZeroU32::new(nodes.len() as u32 - 1).unwrap())
         };
         self.node_handle(id)
+    }
+
+    pub fn print(&self, out: &mut Write) -> io::Result<()>
+    where
+        K: NodeKind,
+    {
+        writeln!(out, "digraph vsdg {{")?;
+        for id in 1..self.nodes.borrow().len() {
+            let node = self.node_handle(NodeId(NonZero::new(id as u32).unwrap()));
+            writeln!(out, r#"    {} [label="{:?}"]"#, node.id.index(), node)?;
+            for i in 0..node.num_inputs() {
+                for source in node.input(i).sources() {
+                    writeln!(
+                        out,
+                        "    {} -> {}",
+                        source.0.node.id.index(),
+                        node.id.index()
+                    )?;
+                }
+            }
+        }
+        writeln!(out, "}}")
     }
 
     fn node_data(&self, id: NodeId) -> Ref<NodeData> {

@@ -2,8 +2,9 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::{InstructionData, InstructionFormat};
 use cranelift_codegen::ir::{self, FuncRef, Heap, MemFlags, Opcode, TrapCode, Value, ValueDef};
 use std::collections::HashMap;
+use std::fmt;
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Op {
     Simple { opcode: Opcode },
     Const { opcode: Opcode, imm: u64 },
@@ -15,6 +16,26 @@ pub enum Op {
     Trap { opcode: Opcode, code: TrapCode },
     IndirectCall { input_count: u32, output_count: u32 },
     Param,
+}
+
+impl fmt::Debug for Op {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Op::Simple { opcode } => write!(f, "{:?}", opcode),
+            Op::Const { opcode, imm } => write!(f, "{:?}({:?})", opcode, imm),
+            Op::IntCmp { opcode, cond } => write!(f, "{:?}({:?})", opcode, cond),
+            Op::FloatCmp { opcode, cond } => write!(f, "{:?}({:?})", opcode, cond),
+            Op::FuncAddr { opcode, func_ref } => write!(f, "{:?}({:?})", opcode, func_ref),
+            Op::HeapAddr { opcode, heap } => write!(f, "{:?}({:?})", opcode, heap),
+            Op::Memory { opcode, flags } => write!(f, "{:?}({:?})", opcode, flags),
+            Op::Trap { opcode, code } => write!(f, "{:?}({:?})", opcode, code),
+            Op::IndirectCall {
+                input_count,
+                output_count,
+            } => write!(f, "IndirectCall({}, {})", input_count, output_count),
+            Op::Param => write!(f, "Param"),
+        }
+    }
 }
 
 impl ::graph::NodeKind for Op {
