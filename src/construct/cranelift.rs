@@ -143,6 +143,20 @@ impl<'g> ConstructCx<'g> {
         node
     }
 
+    fn iadd_offset32(&self, val: ValOut<'g>, offset: ir::immediates::Offset32) -> ValOut<'g> {
+        let offset = offset.into();
+        if offset == 0 {
+            return val;
+        }
+        self.binary(
+            Op::Simple {
+                opcode: Opcode::Iadd,
+            },
+            val,
+            self.const_i32(Opcode::Iconst, offset).val_out(0),
+        ).val_out(0)
+    }
+
     fn convert_inst(&mut self, inst: ir::Inst) {
         let node = match self.func.dfg[inst] {
             InstructionData::NullAry { opcode } => self.graph.add(Op::Simple { opcode }),
@@ -260,13 +274,7 @@ impl<'g> ConstructCx<'g> {
                 offset,
             } => self.unary(
                 Op::Memory { opcode, flags },
-                self.binary(
-                    Op::Simple {
-                        opcode: Opcode::Iadd,
-                    },
-                    self.value(arg),
-                    self.const_i32(Opcode::Iconst, offset.into()).val_out(0),
-                ).val_out(0),
+                self.iadd_offset32(self.value(arg), offset),
             ),
             InstructionData::Store {
                 opcode,
@@ -276,13 +284,7 @@ impl<'g> ConstructCx<'g> {
             } => self.binary(
                 Op::Memory { opcode, flags },
                 self.value(arg),
-                self.binary(
-                    Op::Simple {
-                        opcode: Opcode::Iadd,
-                    },
-                    self.value(ptr),
-                    self.const_i32(Opcode::Iconst, offset.into()).val_out(0),
-                ).val_out(0),
+                self.iadd_offset32(self.value(ptr), offset),
             ),
 
             InstructionData::Trap { opcode, code } => self.graph.add(Op::Trap { opcode, code }),
