@@ -4,6 +4,7 @@ use cranelift_codegen::ir::{self, FuncRef, Heap, MemFlags, Opcode, TrapCode, Val
 use graph::{self, NodeKind, Sig};
 use std::collections::HashMap;
 use std::fmt;
+use std::mem;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -341,4 +342,7 @@ pub fn construct_function<'g>(graph: &'g Graph, func: &ir::Function) {
             cx.convert_inst(inst);
         }
     }
+
+    // HACK keep the graph nodes live.
+    mem::forget(cx);
 }
