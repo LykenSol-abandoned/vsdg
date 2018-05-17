@@ -16,6 +16,7 @@ pub enum Op {
     HeapAddr { opcode: Opcode, heap: Heap },
     Memory { opcode: Opcode, flags: MemFlags },
     Trap { opcode: Opcode, code: TrapCode },
+    DirectCall { sig: Sig, func_ref: FuncRef },
     IndirectCall { sig: Sig },
     ParamVal,
     ParamSt,
@@ -32,6 +33,7 @@ impl fmt::Debug for Op {
             Op::HeapAddr { opcode, heap } => write!(f, "{:?}({:?})", opcode, heap),
             Op::Memory { opcode, flags } => write!(f, "{:?}({:?})", opcode, flags),
             Op::Trap { opcode, code } => write!(f, "{:?}({:?})", opcode, code),
+            Op::DirectCall { func_ref, .. } => write!(f, "{:?}", func_ref),
             Op::IndirectCall { sig } => write!(f, "IndirectCall({:?})", sig),
             Op::ParamVal => write!(f, "ParamVal"),
             Op::ParamSt => write!(f, "ParamSt"),
@@ -67,6 +69,8 @@ impl Callee for Op {
                 1,
             ),
             Trap { .. } => (0, 1, 0, 1),
+
+            DirectCall { sig, .. } => return sig,
 
             IndirectCall { mut sig } => {
                 sig.val_ins += 1;
@@ -225,31 +229,43 @@ impl<'g> ConstructCx<'g> {
                 self.unary(Op::FloatCmp { opcode, cond }, self.value(arg))
             }
 
-            //InstructionData::IndirectCall
             InstructionData::Call {
                 opcode: Opcode::Call,
                 ref args,
                 func_ref,
             } => {
                 let args = args.as_slice(&self.func.dfg.value_lists);
-                let node = self.unary(
-                    Op::IndirectCall {
-                        sig: Sig {
-                            val_ins: args.len() as u32,
-                            st_ins: 1,
-                            val_outs: self.func.dfg.inst_results(inst).len() as u32,
-                            st_outs: 1,
-                        },
+                let node = self.graph.call(Op::DirectCall {
+                    sig: Sig {
+                        val_ins: args.len() as u32,
+                        st_ins: 1,
+                        val_outs: self.func.dfg.inst_results(inst).len() as u32,
+                        st_outs: 1,
                     },
-                    self.graph
-                        .call(Op::FuncAddr {
-                            opcode: Opcode::FuncAddr,
-                            func_ref,
-                        })
-                        .val_out(0),
-                );
+                    func_ref,
+                });
                 for (i, &arg) in args.iter().enumerate() {
-                    node.val_in(1 + i).set_source(self.value(arg));
+                    node.val_in(i).set_source(self.value(arg));
+                }
+                node
+            }
+
+            InstructionData::CallIndirect {
+                opcode: Opcode::CallIndirect,
+                ref args,
+                ..
+            } => {
+                let args = args.as_slice(&self.func.dfg.value_lists);
+                let node = self.graph.call(Op::IndirectCall {
+                    sig: Sig {
+                        val_ins: args.len() as u32 - 1,
+                        st_ins: 1,
+                        val_outs: self.func.dfg.inst_results(inst).len() as u32,
+                        st_outs: 1,
+                    },
+                });
+                for (i, &arg) in args.iter().enumerate() {
+                    node.val_in(i).set_source(self.value(arg));
                 }
                 node
             }
