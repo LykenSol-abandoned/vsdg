@@ -353,6 +353,7 @@ pub fn construct_function<'g>(graph: &'g Graph, func: &ir::Function) {
             match func.dfg[inst] {
                 InstructionData::Jump { .. }
                 | InstructionData::Branch { .. }
+                | InstructionData::BranchTable { .. }
                 | InstructionData::MultiAry { .. } => continue,
                 _ => {}
             }
