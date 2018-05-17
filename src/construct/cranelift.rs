@@ -24,9 +24,13 @@ pub enum Op {
 
 impl fmt::Debug for Op {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
+        match *self {
             Op::Simple { opcode } => write!(f, "{:?}", opcode),
-            Op::Const { opcode, imm } => write!(f, "{:?}({:?})", opcode, imm),
+            Op::Const { opcode, imm } => match opcode {
+                Opcode::F32const => write!(f, "{:?}({:?})", opcode, f32::from_bits(imm as u32)),
+                Opcode::F64const => write!(f, "{:?}({:?})", opcode, f64::from_bits(imm)),
+                _ => write!(f, "{:?}({:?})", opcode, imm),
+            },
             Op::IntCmp { opcode, cond } => write!(f, "{:?}({:?})", opcode, cond),
             Op::FloatCmp { opcode, cond } => write!(f, "{:?}({:?})", opcode, cond),
             Op::FuncAddr { opcode, func_ref } => write!(f, "{:?}({:?})", opcode, func_ref),
