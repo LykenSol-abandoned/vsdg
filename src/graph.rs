@@ -1,5 +1,4 @@
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::io::{self, Write};
@@ -45,17 +44,11 @@ struct OutData {
     sinks: Cell<Option<SinkList>>,
 }
 
-struct NodeData {
+struct NodeData<C> {
     ins: Vec<InData>,
     outs: Vec<OutData>,
-    kind: u32,
+    kind: NodeKind<C>,
     ref_count: Cell<u32>,
-}
-
-pub struct Graph<K> {
-    nodes: RefCell<Vec<NodeData>>,
-    kinds: RefCell<Vec<K>>,
-    kind_index: RefCell<HashMap<K, u32>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -66,57 +59,65 @@ pub struct Sig {
     pub st_outs: u32,
 }
 
-pub trait NodeKind: Clone + Eq + Hash + fmt::Debug {
+pub trait Callee: Clone + Eq + Hash + fmt::Debug {
     fn sig(&self) -> Sig;
 }
 
-impl<K> Graph<K> {
-    pub fn new() -> Graph<K>
+#[derive(Debug)]
+pub enum NodeKind<C> {
+    Call(C),
+}
+
+impl<C: Callee> NodeKind<C> {
+    pub fn sig(&self) -> Sig {
+        match self {
+            NodeKind::Call(c) => c.sig(),
+        }
+    }
+}
+
+pub struct Graph<C> {
+    nodes: RefCell<Vec<Option<NodeData<C>>>>,
+}
+
+impl<C> Graph<C> {
+    pub fn new() -> Graph<C>
     where
-        K: NodeKind,
+        C: Callee,
     {
         Graph {
-            nodes: RefCell::new(vec![NodeData {
-                ins: vec![],
-                outs: vec![],
-                kind: 0,
-                ref_count: Cell::new(0),
-            }]),
-            kinds: RefCell::new(vec![]),
-            kind_index: RefCell::new(HashMap::new()),
+            nodes: RefCell::new(vec![None]),
         }
     }
 
-    pub fn add(&self, kind: K) -> Node<K>
+    pub fn create(&self, kind: NodeKind<C>) -> Node<C>
     where
-        K: NodeKind,
+        C: Callee,
     {
         let sig = kind.sig();
-        let kind = *self
-            .kind_index
-            .borrow_mut()
-            .entry(kind.clone())
-            .or_insert_with(|| {
-                let mut kinds = self.kinds.borrow_mut();
-                kinds.push(kind);
-                kinds.len() as u32 - 1
-            });
         let id = {
             let mut nodes = self.nodes.borrow_mut();
-            nodes.push(NodeData {
+            nodes.push(Some(NodeData {
                 ins: vec![InData::default(); (sig.val_ins + sig.st_ins) as usize],
                 outs: vec![OutData::default(); (sig.val_outs + sig.st_outs) as usize],
-                kind: kind as u32,
+                kind,
                 ref_count: Cell::new(0),
-            });
+            }));
             NodeId(NonZeroU32::new(nodes.len() as u32 - 1).unwrap())
         };
         self.node_handle(id)
     }
 
+    pub fn call(&self, callee: C) -> Node<C>
+    where
+        C: Callee,
+    {
+        self.create(NodeKind::Call(callee))
+    }
+
     pub fn print(&self, out: &mut Write) -> io::Result<()>
     where
-        K: NodeKind,
+        C: Callee,
     {
         writeln!(out, "digraph vsdg {{")?;
         for id in 1..self.nodes.borrow().len() {
@@ -125,7 +126,11 @@ impl<K> Graph<K> {
                 continue;
             }
             let node = self.node_handle(id);
-            writeln!(out, r#"    {} [label="{:?}"]"#, node.id.index(), node)?;
+            match *node.kind() {
+                NodeKind::Call(ref callee) => {
+                    writeln!(out, r#"    {} [label="{:?}"]"#, node.id.index(), callee)?;
+                }
+            }
             let sig = node.kind().sig();
             for i in 0..sig.val_ins {
                 for source in node.val_in(i as usize).maybe_source() {
@@ -151,8 +156,10 @@ impl<K> Graph<K> {
         writeln!(out, "}}")
     }
 
-    fn node_data(&self, id: NodeId) -> Ref<NodeData> {
-        Ref::map(self.nodes.borrow(), |nodes| &nodes[id.index()])
+    fn node_data(&self, id: NodeId) -> Ref<NodeData<C>> {
+        Ref::map(self.nodes.borrow(), |nodes| {
+            nodes[id.index()].as_ref().unwrap()
+        })
     }
 
     fn in_data(&self, id: InId) -> Ref<InData> {
@@ -183,11 +190,7 @@ impl<K> Graph<K> {
         }
 
         // FIXME: do this without borrow_mut.
-        let mut nodes = self.nodes.borrow_mut();
-        let data = &mut nodes[id.index()];
-        data.ins.clear();
-        data.outs.clear();
-        data.kind = 0;
+        self.nodes.borrow_mut()[id.index()] = None;
     }
 
     fn connect(&self, sink: InId, source: OutId) {
@@ -261,20 +264,20 @@ impl<K> Graph<K> {
         self.release_node(source.node)
     }
 
-    fn node_handle(&self, id: NodeId) -> Node<K> {
+    fn node_handle(&self, id: NodeId) -> Node<C> {
         let data = self.node_data(id);
         data.ref_count.set(data.ref_count.get() + 1);
         Node { graph: self, id }
     }
 
-    fn in_handle(&self, id: InId) -> In<K> {
+    fn in_handle(&self, id: InId) -> In<C> {
         In {
             node: self.node_handle(id.node),
             port: id.index,
         }
     }
 
-    fn out_handle(&self, id: OutId) -> Out<K> {
+    fn out_handle(&self, id: OutId) -> Out<C> {
         Out {
             node: self.node_handle(id.node),
             port: id.index,
@@ -282,25 +285,23 @@ impl<K> Graph<K> {
     }
 }
 
-pub struct Node<'g, K: 'g> {
-    graph: &'g Graph<K>,
+pub struct Node<'g, C: 'g> {
+    graph: &'g Graph<C>,
     id: NodeId,
 }
 
-impl<'g, K> Node<'g, K> {
-    fn data(&self) -> Ref<'g, NodeData> {
+impl<'g, C> Node<'g, C> {
+    fn data(&self) -> Ref<'g, NodeData<C>> {
         self.graph.node_data(self.id)
     }
 
-    pub fn kind(&self) -> Ref<'g, K> {
-        Ref::map(self.graph.kinds.borrow(), |kinds| {
-            &kinds[self.data().kind as usize]
-        })
+    pub fn kind(&self) -> Ref<'g, NodeKind<C>> {
+        Ref::map(self.data(), |data| &data.kind)
     }
 }
 
-impl<'g, K: NodeKind> Node<'g, K> {
-    pub fn val_in(&self, i: usize) -> ValIn<'g, K> {
+impl<'g, C: Callee> Node<'g, C> {
+    pub fn val_in(&self, i: usize) -> ValIn<'g, C> {
         let sig = self.kind().sig();
         assert!(i < sig.val_ins as usize);
         ValIn(In {
@@ -309,7 +310,7 @@ impl<'g, K: NodeKind> Node<'g, K> {
         })
     }
 
-    pub fn st_in(&self, i: usize) -> StIn<'g, K> {
+    pub fn st_in(&self, i: usize) -> StIn<'g, C> {
         let sig = self.kind().sig();
         assert!(i < sig.st_ins as usize);
         StIn(In {
@@ -318,7 +319,7 @@ impl<'g, K: NodeKind> Node<'g, K> {
         })
     }
 
-    pub fn val_out(&self, i: usize) -> ValOut<'g, K> {
+    pub fn val_out(&self, i: usize) -> ValOut<'g, C> {
         let sig = self.kind().sig();
         assert!(i < sig.val_outs as usize);
         ValOut(Out {
@@ -327,7 +328,7 @@ impl<'g, K: NodeKind> Node<'g, K> {
         })
     }
 
-    pub fn st_out(&self, i: usize) -> StOut<'g, K> {
+    pub fn st_out(&self, i: usize) -> StOut<'g, C> {
         let sig = self.kind().sig();
         assert!(i < sig.st_outs as usize);
         StOut(Out {
@@ -337,35 +338,31 @@ impl<'g, K: NodeKind> Node<'g, K> {
     }
 }
 
-impl<'g, K: fmt::Debug> fmt::Debug for Node<'g, K> {
+impl<'g, C: fmt::Debug> fmt::Debug for Node<'g, C> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{:?}",
-            self.graph.kinds.borrow()[self.data().kind as usize]
-        )
+        write!(f, "{:?}", self.kind())
     }
 }
 
-impl<'g, K> Clone for Node<'g, K> {
+impl<'g, C> Clone for Node<'g, C> {
     fn clone(&self) -> Self {
         self.graph.node_handle(self.id)
     }
 }
 
-impl<'g, K> Drop for Node<'g, K> {
+impl<'g, C> Drop for Node<'g, C> {
     fn drop(&mut self) {
         self.graph.release_node(self.id);
     }
 }
 
 #[derive(Clone)]
-struct In<'g, K: 'g> {
-    node: Node<'g, K>,
+struct In<'g, C: 'g> {
+    node: Node<'g, C>,
     port: u32,
 }
 
-impl<'g, K> In<'g, K> {
+impl<'g, C> In<'g, C> {
     fn id(&self) -> InId {
         InId {
             node: self.node.id,
@@ -377,25 +374,25 @@ impl<'g, K> In<'g, K> {
         self.node.graph.in_data(self.id())
     }
 
-    fn maybe_source(&self) -> Option<Out<'g, K>> {
+    fn maybe_source(&self) -> Option<Out<'g, C>> {
         self.data()
             .source
             .get()
             .map(|source| self.node.graph.out_handle(source))
     }
 
-    fn set_source(&self, source: Out<'g, K>) {
+    fn set_source(&self, source: Out<'g, C>) {
         self.node.graph.connect(self.id(), source.id());
     }
 }
 
 #[derive(Clone)]
-struct Out<'g, K: 'g> {
-    node: Node<'g, K>,
+struct Out<'g, C: 'g> {
+    node: Node<'g, C>,
     port: u32,
 }
 
-impl<'g, K> Out<'g, K> {
+impl<'g, C> Out<'g, C> {
     fn id(&self) -> OutId {
         OutId {
             node: self.node.id,
@@ -407,7 +404,7 @@ impl<'g, K> Out<'g, K> {
         self.node.graph.out_data(self.id())
     }
 
-    fn sinks(&self) -> Sinks<'g, K> {
+    fn sinks(&self) -> Sinks<'g, C> {
         Sinks {
             first_and_last: self.data().sinks.get().map(|sinks| {
                 (
@@ -419,14 +416,14 @@ impl<'g, K> Out<'g, K> {
     }
 }
 
-struct Sinks<'g, K: 'g> {
-    first_and_last: Option<(In<'g, K>, In<'g, K>)>,
+struct Sinks<'g, C: 'g> {
+    first_and_last: Option<(In<'g, C>, In<'g, C>)>,
 }
 
-impl<'g, K> Iterator for Sinks<'g, K> {
-    type Item = In<'g, K>;
+impl<'g, C> Iterator for Sinks<'g, C> {
+    type Item = In<'g, C>;
 
-    fn next(&mut self) -> Option<In<'g, K>> {
+    fn next(&mut self) -> Option<In<'g, C>> {
         match self.first_and_last.take() {
             Some((first, last)) => {
                 if first.id() != last.id() {
@@ -442,8 +439,8 @@ impl<'g, K> Iterator for Sinks<'g, K> {
     }
 }
 
-impl<'g, K> DoubleEndedIterator for Sinks<'g, K> {
-    fn next_back(&mut self) -> Option<In<'g, K>> {
+impl<'g, C> DoubleEndedIterator for Sinks<'g, C> {
+    fn next_back(&mut self) -> Option<In<'g, C>> {
         match self.first_and_last.take() {
             Some((first, last)) => {
                 if first.id() != last.id() {
@@ -460,53 +457,53 @@ impl<'g, K> DoubleEndedIterator for Sinks<'g, K> {
 }
 
 #[derive(Clone)]
-pub struct ValIn<'g, K: 'g>(In<'g, K>);
+pub struct ValIn<'g, C: 'g>(In<'g, C>);
 
-impl<'g, K> ValIn<'g, K> {
-    pub fn maybe_source(&self) -> Option<ValOut<'g, K>> {
+impl<'g, C> ValIn<'g, C> {
+    pub fn maybe_source(&self) -> Option<ValOut<'g, C>> {
         self.0.maybe_source().map(ValOut)
     }
 
-    pub fn source(&self) -> ValOut<'g, K> {
+    pub fn source(&self) -> ValOut<'g, C> {
         self.maybe_source().unwrap()
     }
 
-    pub fn set_source(&self, source: ValOut<'g, K>) {
+    pub fn set_source(&self, source: ValOut<'g, C>) {
         self.0.set_source(source.0)
     }
 }
 
 #[derive(Clone)]
-pub struct StIn<'g, K: 'g>(In<'g, K>);
+pub struct StIn<'g, C: 'g>(In<'g, C>);
 
-impl<'g, K> StIn<'g, K> {
-    pub fn maybe_source(&self) -> Option<StOut<'g, K>> {
+impl<'g, C> StIn<'g, C> {
+    pub fn maybe_source(&self) -> Option<StOut<'g, C>> {
         self.0.maybe_source().map(StOut)
     }
 
-    pub fn source(&self) -> StOut<'g, K> {
+    pub fn source(&self) -> StOut<'g, C> {
         self.maybe_source().unwrap()
     }
 
-    pub fn set_source(&self, source: StOut<'g, K>) {
+    pub fn set_source(&self, source: StOut<'g, C>) {
         self.0.set_source(source.0)
     }
 }
 
 #[derive(Clone)]
-pub struct ValOut<'g, K: 'g>(Out<'g, K>);
+pub struct ValOut<'g, C: 'g>(Out<'g, C>);
 
-impl<'g, K> ValOut<'g, K> {
-    pub fn sinks(&self) -> impl Iterator<Item = ValIn<'g, K>> {
+impl<'g, C> ValOut<'g, C> {
+    pub fn sinks(&self) -> impl Iterator<Item = ValIn<'g, C>> {
         self.0.sinks().map(ValIn)
     }
 }
 
 #[derive(Clone)]
-pub struct StOut<'g, K: 'g>(Out<'g, K>);
+pub struct StOut<'g, C: 'g>(Out<'g, C>);
 
-impl<'g, K> StOut<'g, K> {
-    pub fn sinks(&self) -> impl Iterator<Item = StIn<'g, K>> {
+impl<'g, C> StOut<'g, C> {
+    pub fn sinks(&self) -> impl Iterator<Item = StIn<'g, C>> {
         self.0.sinks().map(StIn)
     }
 }

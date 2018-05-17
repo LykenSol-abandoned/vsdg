@@ -1,7 +1,7 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::instructions::{InstructionData, InstructionFormat};
 use cranelift_codegen::ir::{self, FuncRef, Heap, MemFlags, Opcode, TrapCode, Value, ValueDef};
-use graph::{self, NodeKind, Sig};
+use graph::{self, Callee, Sig};
 use std::collections::HashMap;
 use std::fmt;
 use std::mem;
@@ -39,7 +39,7 @@ impl fmt::Debug for Op {
     }
 }
 
-impl NodeKind for Op {
+impl Callee for Op {
     fn sig(&self) -> Sig {
         use self::Op::*;
         let (val_ins, st_ins, val_outs, st_outs) = match *self {
@@ -112,7 +112,7 @@ impl<'g> ConstructCx<'g> {
     }
 
     fn const_u64(&self, opcode: Opcode, imm: u64) -> Node<'g> {
-        self.graph.add(Op::Const { opcode, imm })
+        self.graph.call(Op::Const { opcode, imm })
     }
 
     fn const_i64(&self, opcode: Opcode, imm: i64) -> Node<'g> {
@@ -124,20 +124,20 @@ impl<'g> ConstructCx<'g> {
     }
 
     fn unary(&self, op: Op, x: ValOut<'g>) -> Node<'g> {
-        let node = self.graph.add(op);
+        let node = self.graph.call(op);
         node.val_in(0).set_source(x);
         node
     }
 
     fn binary(&self, op: Op, a: ValOut<'g>, b: ValOut<'g>) -> Node<'g> {
-        let node = self.graph.add(op);
+        let node = self.graph.call(op);
         node.val_in(0).set_source(a);
         node.val_in(1).set_source(b);
         node
     }
 
     fn ternary(&self, op: Op, a: ValOut<'g>, b: ValOut<'g>, c: ValOut<'g>) -> Node<'g> {
-        let node = self.graph.add(op);
+        let node = self.graph.call(op);
         node.val_in(0).set_source(a);
         node.val_in(1).set_source(b);
         node.val_in(2).set_source(c);
@@ -160,7 +160,7 @@ impl<'g> ConstructCx<'g> {
 
     fn convert_inst(&mut self, inst: ir::Inst) {
         let node = match self.func.dfg[inst] {
-            InstructionData::NullAry { opcode } => self.graph.add(Op::Simple { opcode }),
+            InstructionData::NullAry { opcode } => self.graph.call(Op::Simple { opcode }),
 
             InstructionData::Unary { opcode, arg } => {
                 self.unary(Op::Simple { opcode }, self.value(arg))
@@ -242,7 +242,7 @@ impl<'g> ConstructCx<'g> {
                         },
                     },
                     self.graph
-                        .add(Op::FuncAddr {
+                        .call(Op::FuncAddr {
                             opcode: Opcode::FuncAddr,
                             func_ref,
                         })
@@ -255,7 +255,7 @@ impl<'g> ConstructCx<'g> {
             }
 
             InstructionData::FuncAddr { opcode, func_ref } => {
-                self.graph.add(Op::FuncAddr { opcode, func_ref })
+                self.graph.call(Op::FuncAddr { opcode, func_ref })
             }
             InstructionData::HeapAddr {
                 opcode,
@@ -288,7 +288,7 @@ impl<'g> ConstructCx<'g> {
                 self.iadd_offset32(self.value(ptr), offset),
             ),
 
-            InstructionData::Trap { opcode, code } => self.graph.add(Op::Trap { opcode, code }),
+            InstructionData::Trap { opcode, code } => self.graph.call(Op::Trap { opcode, code }),
 
             _ => {
                 panic!(
@@ -313,16 +313,17 @@ pub fn construct_function<'g>(graph: &'g Graph, func: &ir::Function) {
         func,
         graph,
         instructions: HashMap::new(),
-        ebb_params: func.layout
+        ebb_params: func
+            .layout
             .ebbs()
             .map(|ebb| {
                 (
                     ebb,
                     (
                         (0..func.dfg.num_ebb_params(ebb))
-                            .map(|_| graph.add(Op::ParamVal).val_out(0))
+                            .map(|_| graph.call(Op::ParamVal).val_out(0))
                             .collect(),
-                        graph.add(Op::ParamSt).st_out(0),
+                        graph.call(Op::ParamSt).st_out(0),
                     ),
                 )
             })
